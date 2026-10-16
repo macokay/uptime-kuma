@@ -129,7 +129,7 @@ function installMocks() {
             exports: { clear() {} },
         },
         auth: {
-            id: require.resolve(path.join(__dirname, "../../server/auth.js")),
+            id: require.resolve(path.join(__dirname, "../../server/auth")),
             exports: {
                 apiAuth(req, res, next) {
                     if (!req.headers.authorization) {
@@ -140,15 +140,15 @@ function installMocks() {
             },
         },
         uptimeServer: {
-            id: require.resolve(path.join(__dirname, "../../server/uptime-kuma-server.js")),
+            id: require.resolve(path.join(__dirname, "../../server/uptime-kuma-server")),
             exports: { UptimeKumaServer: { getInstance: () => fakeServer } },
         },
         maintenance: {
-            id: require.resolve(path.join(__dirname, "../../server/model/maintenance.js")),
+            id: require.resolve(path.join(__dirname, "../../server/model/maintenance")),
             exports: fakeMaintenanceModel,
         },
         util: {
-            id: require.resolve(path.join(__dirname, "../../src/util.js")),
+            id: require.resolve(path.join(__dirname, "../../src/util")),
             exports: { log: { error() {}, info() {}, debug() {}, warn() {} } },
         },
     };
