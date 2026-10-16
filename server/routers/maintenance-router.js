@@ -1,6 +1,7 @@
 let express = require("express");
 const { R } = require("redbean-node");
 const dayjs = require("dayjs");
+const { RateLimiter } = require("limiter");
 const apicache = require("../modules/apicache");
 const { apiAuth } = require("../auth");
 const { UptimeKumaServer } = require("../uptime-kuma-server");
@@ -13,6 +14,7 @@ const server = UptimeKumaServer.getInstance();
 
 const ALLOWED_STRATEGIES = ["manual", "single"];
 const MAX_MONITORS_PER_REQUEST = 200;
+const MAX_REQUESTS_PER_MINUTE = 120;
 
 /**
  * Resolve the owner of API-created maintenance windows. Kuma runs single-user in practice.
@@ -132,12 +134,39 @@ function parseDate(value) {
     return isNaN(parsed.getTime()) ? null : value;
 }
 
+// Own limiter: the shared apiRateLimiter is checked with 0 tokens in apiAuth and can never reject.
+const rateLimiter = new RateLimiter({
+    tokensPerInterval: MAX_REQUESTS_PER_MINUTE,
+    interval: "minute",
+    fireImmediately: true,
+});
+
+router.use("/api/maintenance", async (_request, response, next) => {
+    if ((await rateLimiter.removeTokens(1)) < 0) {
+        return response.status(429).json({ ok: false, msg: "Too many requests" });
+    }
+    next();
+});
+
 router.use("/api/maintenance", apiAuth);
 
 router.get("/api/maintenance", async (_request, response) => {
     try {
         const list = await server.getMaintenanceJSONList();
         response.json({ ok: true, maintenance: Object.values(list) });
+    } catch (e) {
+        log.error("maintenance-api", e);
+        response.status(500).json({ ok: false, msg: "Internal error" });
+    }
+});
+
+router.get("/api/maintenance/:id", async (request, response) => {
+    try {
+        const maintenance = findMaintenance(request.params.id);
+        if (!maintenance) {
+            return response.status(404).json({ ok: false, msg: "Maintenance not found" });
+        }
+        response.json({ ok: true, maintenance: await maintenance.toJSON() });
     } catch (e) {
         log.error("maintenance-api", e);
         response.status(500).json({ ok: false, msg: "Internal error" });

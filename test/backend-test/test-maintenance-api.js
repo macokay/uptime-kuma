@@ -88,6 +88,9 @@ function makeFakeMaintenance(id, title) {
         async run() {
             this.ran = true;
         },
+        async toJSON() {
+            return { id: this.id, title: this.title, active: this.active };
+        },
     };
 }
 
@@ -358,5 +361,37 @@ describe("GET /api/maintenance", () => {
         assert.strictEqual(res.status, 200);
         assert.strictEqual(res.body.maintenance.length, 1);
         assert.strictEqual(res.body.maintenance[0].title, "a");
+    });
+});
+
+describe("GET /api/maintenance/:id", () => {
+    test("returns one window", async () => {
+        state.maintenanceList[3] = makeFakeMaintenance(3, "one");
+        const res = await call("GET", "/api/maintenance/3");
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(res.body.maintenance.title, "one");
+    });
+
+    test("unknown id returns 404", async () => {
+        const res = await call("GET", "/api/maintenance/404");
+        assert.strictEqual(res.status, 404);
+    });
+
+    test("requires auth", async () => {
+        state.maintenanceList[3] = makeFakeMaintenance(3, "one");
+        const res = await call("GET", "/api/maintenance/3", undefined, {});
+        assert.strictEqual(res.status, 401);
+    });
+});
+
+describe("rate limit", () => {
+    test("returns 429 after the per-minute budget is used", async () => {
+        const codes = [];
+        for (let i = 0; i < 140; i++) {
+            const res = await call("GET", "/api/maintenance", undefined, {});
+            codes.push(res.status);
+        }
+        assert.ok(codes.includes(429), "expected a 429 within 140 requests");
+        assert.ok(!codes.slice(0, 20).includes(429), "first requests must not be limited");
     });
 });
