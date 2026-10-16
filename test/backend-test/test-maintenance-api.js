@@ -2,6 +2,10 @@ const { describe, test, before, after, beforeEach } = require("node:test");
 const assert = require("node:assert");
 const path = require("path");
 const express = require("express");
+const dayjs = require("dayjs");
+
+dayjs.extend(require("dayjs/plugin/utc"));
+dayjs.extend(require("../../server/modules/dayjs/plugin/timezone"));
 
 const routerPath = path.join(__dirname, "../../server/routers/maintenance-router.js");
 
@@ -11,12 +15,18 @@ const state = {
     execs: [],
     sent: [],
     getCellResult: 1,
+    missingIDs: false,
+    runFails: false,
+    lastObj: null,
 };
 
 const fakeServer = {
     maintenanceList: state.maintenanceList,
     getMaintenance(id) {
         return this.maintenanceList[id] || null;
+    },
+    async getTimezone() {
+        return "UTC";
     },
     async getMaintenanceJSONList() {
         const out = {};
@@ -31,7 +41,10 @@ const fakeServer = {
 };
 
 const fakeRedbean = {
-    async getCell() {
+    async getCell(sql, params) {
+        if (sql.includes("COUNT(*)")) {
+            return state.missingIDs ? params.length - 1 : params.length;
+        }
         return state.getCellResult;
     },
     async exec(sql, params) {
@@ -80,6 +93,7 @@ function makeFakeMaintenance(id, title) {
 
 const fakeMaintenanceModel = {
     async jsonToBean(bean, obj) {
+        state.lastObj = obj;
         Object.assign(bean, {
             title: obj.title,
             strategy: obj.strategy,
@@ -88,6 +102,9 @@ const fakeMaintenanceModel = {
             end_date: obj.dateRange[1],
         });
         bean.run = async function () {
+            if (state.runFails) {
+                throw new Error("run failed");
+            }
             this.ran = true;
         };
         bean.stop = function () {
@@ -166,6 +183,9 @@ beforeEach(() => {
     state.execs.length = 0;
     state.sent.length = 0;
     state.getCellResult = 1;
+    state.missingIDs = false;
+    state.runFails = false;
+    state.lastObj = null;
 });
 
 const AUTH = { authorization: "Basic dXNlcjpwYXNz" };
@@ -229,6 +249,59 @@ describe("POST /api/maintenance", () => {
             end: "2026-10-17T09:00:00Z",
         });
         assert.strictEqual(res.status, 400);
+    });
+
+    test("rejects unknown monitor id", async () => {
+        state.missingIDs = true;
+        const res = await call("POST", "/api/maintenance", { title: "x", monitorIds: [4, 999] });
+        assert.strictEqual(res.status, 400);
+        assert.strictEqual(state.stored.length, 0);
+    });
+
+    test("rejects unknown status page id", async () => {
+        state.missingIDs = true;
+        const res = await call("POST", "/api/maintenance", { title: "x", statusPageIds: [1, 2] });
+        assert.strictEqual(res.status, 400);
+    });
+
+    test("duplicate monitor ids are linked once", async () => {
+        const res = await call("POST", "/api/maintenance", { title: "x", monitorIds: [4, 4, 7] });
+        assert.strictEqual(res.status, 201);
+        const linked = state.stored.filter((b) => b.__type === "monitor_maintenance").map((b) => b.monitor_id);
+        assert.deepStrictEqual(linked, [4, 7]);
+    });
+
+    test("rejects invalid timezone before storing anything", async () => {
+        const res = await call("POST", "/api/maintenance", { title: "x", timezone: "Not/AZone" });
+        assert.strictEqual(res.status, 400);
+        assert.strictEqual(state.stored.length, 0);
+    });
+
+    test("accepts UTC, SAME_AS_SERVER and IANA timezone", async () => {
+        for (const timezone of ["UTC", "SAME_AS_SERVER", "Europe/Copenhagen"]) {
+            const res = await call("POST", "/api/maintenance", { title: "x", timezone });
+            assert.strictEqual(res.status, 201, timezone);
+        }
+    });
+
+    test("single window converts absolute instant to wall-clock in window timezone", async () => {
+        const res = await call("POST", "/api/maintenance", {
+            title: "x",
+            strategy: "single",
+            timezone: "Europe/Copenhagen",
+            start: "2026-10-20T10:00:00Z",
+            end: "2026-10-20T11:30:00Z",
+        });
+        assert.strictEqual(res.status, 201);
+        assert.deepStrictEqual(state.lastObj.dateRange, ["2026-10-20 12:00:00", "2026-10-20 13:30:00"]);
+    });
+
+    test("failed run rolls back the stored window", async () => {
+        state.runFails = true;
+        const res = await call("POST", "/api/maintenance", { title: "x", monitorIds: [4] });
+        assert.strictEqual(res.status, 500);
+        assert.deepStrictEqual(Object.keys(state.maintenanceList), []);
+        assert.ok(state.execs.some((e) => e.sql === "DELETE FROM maintenance WHERE id = ?"));
     });
 
     test("rejects non-integer monitor ids", async () => {

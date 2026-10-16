@@ -1,5 +1,6 @@
 let express = require("express");
 const { R } = require("redbean-node");
+const dayjs = require("dayjs");
 const apicache = require("../modules/apicache");
 const { apiAuth } = require("../auth");
 const { UptimeKumaServer } = require("../uptime-kuma-server");
@@ -30,14 +31,14 @@ async function getOwnerUserID() {
  */
 async function replaceLinks(maintenanceID, monitorIDs, statusPageIDs) {
     await R.exec("DELETE FROM monitor_maintenance WHERE maintenance_id = ?", [maintenanceID]);
-    for (const monitorID of monitorIDs) {
+    for (const monitorID of new Set(monitorIDs)) {
         let bean = R.dispense("monitor_maintenance");
         bean.import({ monitor_id: monitorID, maintenance_id: maintenanceID });
         await R.store(bean);
     }
 
     await R.exec("DELETE FROM maintenance_status_page WHERE maintenance_id = ?", [maintenanceID]);
-    for (const statusPageID of statusPageIDs) {
+    for (const statusPageID of new Set(statusPageIDs)) {
         let bean = R.dispense("maintenance_status_page");
         bean.import({ status_page_id: statusPageID, maintenance_id: maintenanceID });
         await R.store(bean);
@@ -55,6 +56,67 @@ function isIdList(value) {
         value.length <= MAX_MONITORS_PER_REQUEST &&
         value.every((id) => Number.isInteger(id) && id > 0)
     );
+}
+
+/**
+ * Check that every id exists in a table.
+ * @param {string} table Internal table name (never user input)
+ * @param {number[]} ids Ids to look up
+ * @returns {Promise<boolean>} True when all ids exist
+ */
+async function allIDsExist(table, ids) {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) {
+        return true;
+    }
+    const placeholders = unique.map(() => "?").join(",");
+    const count = await R.getCell(`SELECT COUNT(*) FROM ${table} WHERE id IN (${placeholders})`, unique);
+    return Number(count) === unique.length;
+}
+
+/**
+ * Check a timezone value the same way the maintenance model will use it.
+ * @param {any} value Input value
+ * @returns {boolean} True for SAME_AS_SERVER, UTC or a valid IANA zone name
+ */
+function isValidTimezone(value) {
+    if (value === "SAME_AS_SERVER" || value === "UTC") {
+        return true;
+    }
+    if (typeof value !== "string" || value === "") {
+        return false;
+    }
+    try {
+        new Intl.DateTimeFormat("en", { timeZone: value });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Kuma stores single-window dates as wall-clock time in the window timezone.
+ * Convert an absolute ISO instant (with Z or offset) to that representation.
+ * @param {string} isoValue ISO date string
+ * @param {string} timezone Timezone of the window
+ * @returns {string} Wall-clock "YYYY-MM-DD HH:mm:ss" in the timezone
+ */
+function toWallClock(isoValue, timezone) {
+    return dayjs(isoValue).tz(timezone).format("YYYY-MM-DD HH:mm:ss");
+}
+
+/**
+ * Remove a half-created maintenance window so a failed request leaves nothing behind.
+ * @param {number} maintenanceID Maintenance id
+ * @returns {Promise<void>}
+ */
+async function rollbackMaintenance(maintenanceID) {
+    const bean = server.maintenanceList[maintenanceID];
+    if (bean) {
+        bean.stop();
+        delete server.maintenanceList[maintenanceID];
+    }
+    await R.exec("DELETE FROM maintenance WHERE id = ?", [maintenanceID]);
 }
 
 /**
@@ -99,15 +161,31 @@ router.post("/api/maintenance", async (request, response) => {
         if (!isIdList(monitorIDs) || !isIdList(statusPageIDs)) {
             return response.status(400).json({ ok: false, msg: "monitorIds/statusPageIds must be id arrays" });
         }
+        if (!(await allIDsExist("monitor", monitorIDs))) {
+            return response.status(400).json({ ok: false, msg: "unknown monitor id in monitorIds" });
+        }
+        if (!(await allIDsExist("status_page", statusPageIDs))) {
+            return response.status(400).json({ ok: false, msg: "unknown status page id in statusPageIds" });
+        }
+
+        if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+            return response
+                .status(400)
+                .json({ ok: false, msg: "timezone must be UTC, SAME_AS_SERVER or an IANA name" });
+        }
+        const timezone = body.timezone ?? "SAME_AS_SERVER";
 
         let startDate = null;
         let endDate = null;
         if (strategy === "single") {
-            startDate = parseDate(body.start);
-            endDate = parseDate(body.end);
-            if (!startDate || !endDate || new Date(endDate) <= new Date(startDate)) {
+            const start = parseDate(body.start);
+            const end = parseDate(body.end);
+            if (!start || !end || new Date(end) <= new Date(start)) {
                 return response.status(400).json({ ok: false, msg: "single needs start and end, end after start" });
             }
+            const effectiveZone = timezone === "SAME_AS_SERVER" ? await server.getTimezone() : timezone;
+            startDate = toWallClock(start, effectiveZone);
+            endDate = toWallClock(end, effectiveZone);
         }
 
         const userID = await getOwnerUserID();
@@ -116,7 +194,7 @@ router.post("/api/maintenance", async (request, response) => {
             description: typeof body.description === "string" ? body.description : "",
             strategy,
             intervalDay: 1,
-            timezoneOption: typeof body.timezone === "string" ? body.timezone : null,
+            timezoneOption: timezone,
             active: body.active === true,
             dateRange: [startDate, endDate],
             timeRange: [],
@@ -130,13 +208,18 @@ router.post("/api/maintenance", async (request, response) => {
         bean.user_id = userID;
         let maintenanceID = await R.store(bean);
 
-        await replaceLinks(maintenanceID, monitorIDs, statusPageIDs);
+        try {
+            await replaceLinks(maintenanceID, monitorIDs, statusPageIDs);
 
-        server.maintenanceList[maintenanceID] = bean;
-        await bean.run(true);
+            server.maintenanceList[maintenanceID] = bean;
+            await bean.run(true);
 
-        apicache.clear();
-        await server.sendMaintenanceListByUserID(userID);
+            apicache.clear();
+            await server.sendMaintenanceListByUserID(userID);
+        } catch (e) {
+            await rollbackMaintenance(maintenanceID);
+            throw e;
+        }
 
         response.status(201).json({ ok: true, maintenanceID });
     } catch (e) {
